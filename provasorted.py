@@ -59,3 +59,10 @@ output_file = 'mat2prova.csv.gz'
 with open(input_file, 'rb') as f_in:
     with gzip.open(output_file, 'wb') as f_out:
         f_out.writelines(f_in)
+
+
+
+
+
+
+##### PROBLEMES DE RAM!!
