@@ -1,0 +1,603 @@
+---
+title: "scATAC-seq OpenProblems"
+author: "Roger Casals"
+date: "2023-11-17"
+output: html_document
+---
+
+#Data and library reading
+
+```{r}
+#############
+setwd("~/Github/OpenProblems")
+
+library(arrow)
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(Seurat)
+library(Signac)
+library(Seurat)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+
+train <- read_parquet("multiome_train.parquet")
+multi <- read.csv("multiome_var_meta.csv")
+meta <- read.csv("multiome_obs_meta.csv")
+
+
+```
+
+
+#Create sparse matrix
+
+```{r}
+#Create objects with "peaks" and "gene expression"
+nueva_train <- train[grep("^chr", train$location), ]
+no_chr <- train[!grepl("chr", train$location), ]
+train <- nueva_train
+```
+
+
+##Sparse matrix Peaks (normalized counts)
+
+```{r}
+customers <- unique(train$location
+)
+products <- unique(train$obs_id
+)
+
+train$row <- match(train$location
+                   , customers)
+train$col <- match(train$obs_id
+                   , products)
+
+df_sparse2 <- sparseMatrix(
+  i = train$row, 
+  j = train$col,
+  x = train$normalized_count,
+  dimnames = list(customers,
+                  products)
+)
+
+dim(df_sparse2)
+```
+
+
+##Sparse matrix Gene expression RNA (normalized_counts)
+
+```{r}
+
+train <- no_chr
+
+customers <- unique(train$location
+)
+products <- unique(train$obs_id
+)
+
+train$row <- match(train$location
+                   , customers)
+train$col <- match(train$obs_id
+                   , products)
+
+df_sparse <- sparseMatrix(
+  i = train$row, 
+  j = train$col,
+  x = train$normalized_count,
+  dimnames = list(customers,
+                  products)
+)
+
+```
+
+
+I don't know if we should use normalized_counts or counts, because after that in Signac multi-omic processment, there is another normalitzation with IDF (Same that the authors say they do in the preprocessment of the data)
+
+
+#Follow Signac Multi-omics tutorial
+
+Fragments file has already been created, it is the file with the "intervals" in BED format, the cell id and the "counts".
+
+
+## RNA OBJECT
+
+```{r}
+
+####### RNA OBJECT
+pbmc <- CreateSeuratObject(
+  counts = df_sparse,
+  assay = "RNA",
+  meta.data=meta
+)
+
+
+```
+
+
+## ATAC OBJECT
+
+```{r}
+
+fragpath <- "~/Github/OpenProblems/nuevo_archivo.tsv.gz"
+
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
+
+###### PEAKS OBJECT
+
+# create ATAC assay and add it to the object
+pbmc[["ATAC"]] <- CreateChromatinAssay(
+  counts = df_sparse2,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+
+### QC
+
+
+```{r}
+DefaultAssay(pbmc) <- "ATAC"
+
+#Nucleosome signal doesn't work, because the widths are bigger than the nucleosome widths that the function has established.
+pbmc <- NucleosomeSignal(pbmc)
+#See the nucleosomeSignal output, only 1 and Inf.
+
+
+#Compute the TSSEnrichment
+pbmc <- TSSEnrichment(pbmc)
+
+pbmc[['RNA']] <- split(pbmc[["RNA"]], f = pbmc$cell_type)
+
+#See the different 
+VlnPlot(
+  object = pbmc,
+  features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment"),
+  ncol = 4,
+  pt.size = 0
+)
+
+
+DensityScatter(pbmc, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+
+summary(pbmc$TSS.enrichment)
+
+
+pbmc[['RNA']] <- JoinLayers(pbmc[["RNA"]])
+DefaultAssay(pbmc) <- "RNA"
+
+pbmc <- JoinLayers(pbmc)
+
+
+
+
+
+
+```
+
+
+
+#### Filtering cells
+
+
+```{r}
+########################
+# filter out low quality cells, changeable numbers, 
+pbmc <- subset(
+  x = pbmc,
+  subset = nCount_ATAC < 18000 &
+    nCount_RNA < 23000 &
+    nCount_ATAC > 1000 &
+    nCount_RNA > 1000 &
+  #  nucleosome_signal < 2 &   ????? Should we know anything about that output?
+    TSS.enrichment > 1
+)
+#pbmc
+
+```
+
+################################ PEAKS CALLING????
+
+####THIS PART IS NOT WORKING!
+
+# call peaks using MACS2
+peaks <- CallPeaks(pbmc)
+##### No troba res el peakcalling o que?
+
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments=Fragments(pbmc),
+  features = peaks,
+  cells = colnames(pbmc)
+)
+
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+pbmc[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+
+
+
+
+```{r}
+
+
+############TREATING THE "COUNTS" AS PEAKS!
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- SCTransform(pbmc)
+pbmc <- RunPCA(pbmc)
+
+
+
+DefaultAssay(pbmc) <- "ATAC"
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 5)
+pbmc <- RunTFIDF(pbmc)
+pbmc <- RunSVD(pbmc)
+
+
+########ATACseqprova o que
+DepthCor(pbmc)
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindClusters(object = pbmc, verbose = FALSE, algorithm = 3, resolution = .05)
+DimPlot(object = pbmc, label = TRUE, group.by = "cell_type") + NoLegend()
+
+
+
+```
+
+
+
+## Gene activities
+
+```{r}
+
+
+
+  #####GENE ACTIVITIES????
+gene.activities <- GeneActivity(pbmc)
+
+
+
+pbmc[['prova']] <- CreateAssayObject(counts = gene.activities)
+
+#We normalize the data
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'prova',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_prova)
+)
+
+
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_RNA)
+)
+
+
+#MALAT1, RPLP1, RPS27
+#SLC8A1, UBE2E2, ZEB2
+#We set default to RNA in order to plot for example
+DefaultAssay(pbmc) <- 'RNA'
+
+#######Mola que es pugui separar entre diferents layers???? o que.
+#pbmc[['RNA']] <- split(pbmc[["RNA"]], f = pbmc$cell_type)
+
+plot1 <- FeaturePlot(
+  object = pbmc,
+  features = c('CIITA', 'UBE2E2', 'ZEB2'),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+
+
+#We set default to RNA in order to plot for example
+DefaultAssay(pbmc) <- 'prova'
+
+plot2 <- FeaturePlot(
+  object = pbmc,
+  features = c('CIITA', 'UBE2E2', 'ZEB2'),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+
+
+plot1 | plot2
+##Això ho podem comparar / predir o alguna vaina loca o que???'
+
+
+
+
+```
+
+
+
+```{r}
+
+DefaultAssay(pbmc) <- "ATAC"
+
+# first compute the GC content for each peak
+pbmc <- RegionStats(pbmc, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+
+
+#PIK3AP1
+#PHF21A
+
+
+
+# link peaks to genes
+pbmc <- LinkPeaks(
+  object = pbmc,
+  peak.assay = "ATAC",
+  expression.assay = "SCT",
+  genes.use = c("CIITA", "UBE2E2", "ZEB2")
+)
+
+
+#DimPlot(pbmc, group.by = "cell_type")
+
+
+Idents(pbmc) <- pbmc@meta.data$cell_type
+
+
+
+
+
+
+
+p1 <- CoveragePlot(
+  object = pbmc,
+  region = "CIITA",
+  features = "CIITA",
+  expression.assay = "SCT",
+  #idents = idents.plot,
+  extend.upstream = 500,
+  extend.downstream = 1000
+)
+
+p2 <- CoveragePlot(
+  object = pbmc,
+  region = "UBE2E2",
+  features = "UBE2E2",
+  expression.assay = "SCT",
+  #idents = idents.plot,
+  extend.upstream = 800,
+  extend.downstream = 500
+)
+
+p3 <- CoveragePlot(
+  object = pbmc,
+  region = "ZEB2",
+  features = "ZEB2",
+  expression.assay = "SCT",
+  #idents = idents.plot,
+  extend.upstream = 800,
+  extend.downstream = 500
+)
+
+#patchwork::wrap_plots(p1, p2, p3, ncol = 1)
+p1
+p2
+p3
+
+
+```
+
+```{r}
+saveRDS(pbmc, file = "/home/roger/Github/OpenProblems/Signac/atacopen.rds")
+
+
+pbmc <- readRDS(file = "/home/roger/Github/OpenProblems/Signac/atacopen.rds")
+```
+
+
+
+## MOTIF ANALYSIS
+
+```{r}
+
+library(Seurat)
+library(Signac)
+library(motifmatchr)
+library(AnnotationDbi)
+library(DirichletMultinomial)
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(patchwork)
+library(BSgenome.Hsapiens.UCSC.hg19)
+
+```
+```{r}
+```
+
+Add list of motifs from JASPAR
+
+```{r}
+
+devtools::install_github("stuart-lab/signac", ref = "develop", auth_token="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")
+install.packages("Signac")
+
+
+library(Signac)
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(species=9606, all_versions=FALSE)
+)
+
+
+# opts = list(species = 9606) # 9606 is the species code for human
+#list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+DefaultAssay(pbmc) <- 'ATAC'
+# add motif information
+pbmc <- AddMotifs(
+  object = pbmc,
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  pfm = pfm
+)
+
+
+pbmc <- Footprint(
+  object = pbmc,
+  motif.name = c("MA0030.1", "MA0031.1"),
+  genome = BSgenome.Hsapiens.UCSC.hg38,
+  upstream = 10000,
+  downstream=10000
+)
+
+InsertionBias(object=pbmc, genome=BSgenome.Hsapiens.UCSC.hg38, region = "chr1-1-249250621", verbose = TRUE)
+
+
+
+```
+
+
+```{r}
+
+Idents(pbmc) <- pbmc@meta.data$cell_type
+
+da_peaks <- FindMarkers(
+  object = pbmc,
+  ident.1 = 'T cells CD8+',
+  ident.2 = 'T regulatory cells',
+  only.pos = TRUE,
+  test.use = 'LR',
+  min.pct = 0.05,
+  latent.vars = 'nCount_ATAC'
+)
+
+# get top differentially accessible peaks
+top.da.peak <- rownames(da_peaks[da_peaks$p_val < 0.005, ])
+
+
+```
+
+
+OPTIONAL 
+```{r}
+open.peaks <- AccessiblePeaks(pbmc, idents = c("T cells CD4+", "B cells"))
+
+meta.feature <- GetAssayData(pbmc, assay = "ATAC", slot = "meta.features")
+
+peaks.matched <- MatchRegionStats(
+  meta.feature = meta.feature[open.peaks, ],
+  query.feature = meta.feature[top.da.peak, ],
+  n = 50000
+)
+
+```
+
+
+
+
+```{r}
+# test enrichment
+enriched.motifs <- FindMotifs(
+  object = pbmc,
+  features = top.da.peak
+)
+```
+
+```{r}
+
+library(ggseqlogo)
+MotifPlot(
+  object = pbmc,
+  motifs = head(rownames(enriched.motifs))
+)
+```
+
+
+```{r}
+
+
+
+library(chromVAR)
+
+pbmc <- RunChromVAR(
+  object = pbmc,
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+
+DefaultAssay(pbmc) <- 'chromvar'
+
+p1 <- DimPlot(pbmc, label = TRUE, pt.size = 0.1) + NoLegend()
+p1
+# look at the activity of Mef2c
+p2 <- FeaturePlot(
+  object = pbmc,
+  features = "MA1513.1",
+  min.cutoff = 'q10',
+  max.cutoff = 'q90',
+  pt.size = 0.1
+)
+
+
+#MA0497.1
+p1 + p2
+```
+
+
+
+```{r}
+
+library(presto)
+differential.activity <- FindMarkers(
+  object = pbmc,
+  ident.1 = 'T cells CD8+',
+  ident.2 = 'T regulatory cells',
+  only.pos = TRUE,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+
+MotifPlot(
+  object = pbmc,
+  motifs = head(rownames(differential.activity)),
+  assay = 'ATAC'
+)
+
+
+```
+
+
+
+```{r}
+DefaultAssay(pbmc) <- "ATAC"
+
+
+
+pbmc <- Footprint(
+  object = pbmc,
+  motif.name = c("KLF15", "EGR1"),
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+
+
+
+# plot the footprint data for each group of cells
+p2 <- PlotFootprint(pbmc, features = c("NRF1", "TCFL5", "HINFP"))
+
+```
+
+
+
+
+
